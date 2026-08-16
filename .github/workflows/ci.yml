@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  frontend:
+    name: Frontend build & tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck + production build
+        run: npm run build
+
+      - name: Unit tests (real SQLite, no Tauri runtime needed)
+        run: npm test
+
+  rust:
+    name: Rust check & tests
+    # Matches the platform this app has actually been built and tested on
+    # throughout development (see development.md's Environment Setup Log) —
+    # cross-platform Tauri builds (Linux/macOS system deps, etc.) are a
+    # separate, later concern, not something to take on speculatively here.
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Local dev on this project hit a real, documented issue where a plain
+      # shell doesn't have the MSVC linker environment initialized (see
+      # "Known environment quirk" in development.md). GitHub's windows-latest
+      # runners are generally fine without this, but it's cheap insurance
+      # against the exact class of problem this project has already been
+      # bitten by once.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: cargo check
+        run: cargo check
+
+      - name: cargo test
+        run: cargo test
