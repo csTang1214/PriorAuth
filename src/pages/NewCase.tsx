@@ -1,6 +1,8 @@
 import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { open } from "@tauri-apps/plugin-dialog";
 import { createCase } from "../db";
+import { importDocument } from "../ocr";
 import type { NewCaseInput } from "../types";
 
 const empty: NewCaseInput = {
@@ -14,6 +16,8 @@ const empty: NewCaseInput = {
 export default function NewCase() {
   const [form, setForm] = useState<NewCaseInput>(empty);
   const [saving, setSaving] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
   const navigate = useNavigate();
 
   function update<K extends keyof NewCaseInput>(key: K, value: string) {
@@ -28,6 +32,37 @@ export default function NewCase() {
       navigate(`/cases/${id}/review`);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleImport() {
+    setImportError(null);
+    const path = await open({
+      title: "Import from document",
+      multiple: false,
+      filters: [
+        { name: "Documents", extensions: ["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp"] },
+      ],
+    });
+    if (!path || Array.isArray(path)) return;
+
+    setImporting(true);
+    try {
+      const extracted = await importDocument(path);
+      // Extracted text is OCR'd/parsed output, not something to trust
+      // blindly — it lands in the same editable field manual entry uses,
+      // appended rather than overwriting so a partially-typed summary
+      // never gets silently discarded.
+      setForm((f) => ({
+        ...f,
+        patient_summary: f.patient_summary
+          ? `${f.patient_summary}\n\n${extracted}`
+          : extracted,
+      }));
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setImporting(false);
     }
   }
 
@@ -93,9 +128,14 @@ export default function NewCase() {
           </label>
         </div>
 
-        <button type="button" className="btn btn-disabled" disabled title="Document import (OCR) is not implemented yet">
-          Import from document (coming soon)
+        <button type="button" className="btn" onClick={handleImport} disabled={importing}>
+          {importing ? "Extracting text…" : "Import from document"}
         </button>
+        {importError && (
+          <p className="error-hint">
+            Could not import this document: {importError}
+          </p>
+        )}
 
         <div className="form-actions">
           <button type="submit" className="btn btn-primary" disabled={saving}>

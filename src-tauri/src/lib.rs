@@ -229,6 +229,178 @@ async fn generate_draft_text(
     ))
 }
 
+// Phase 7 — document import + OCR (spec §4.1). Both external tools this
+// relies on (Tesseract for OCR, Poppler's `pdftoppm` for rendering scanned
+// PDF pages to images) are shelled out to via plain `std::process::Command`
+// from inside this command handler — the same trust model Phase 3 already
+// established for `reqwest` calling Ollama: native Rust code with no
+// special frontend-facing capability grant, not something routed through
+// `tauri-plugin-shell`'s JS-exposed shell API (that plugin governs commands
+// invoked *from the frontend*; nothing here is). Every argument passed to
+// `Command` below is a fixed vector built from a validated file path, never
+// a shell string assembled from user input — there is no shell to inject
+// into.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "bmp"];
+const PDF_PAGE_BREAK_MARKER: &str = "\n\n--- page break ---\n\n";
+// A scanned/image-only PDF's "text layer" extraction returns empty or
+// near-empty noise (stray whitespace, the odd stray character from a
+// mis-parsed structure) rather than a clean empty string — this threshold
+// is what distinguishes "this PDF has no real text layer, fall back to
+// OCR" from "this PDF has real extractable text." 40 non-whitespace
+// characters is comfortably below a real sentence but above what noise
+// extraction has been observed to produce.
+const MIN_MEANINGFUL_TEXT_CHARS: usize = 40;
+
+fn has_extension(path: &std::path::Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| extensions.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn is_meaningful_text(text: &str) -> bool {
+    text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_MEANINGFUL_TEXT_CHARS
+}
+
+// Joins per-page OCR output into one string, dropping blank pages (a
+// mis-rendered or genuinely blank page shouldn't leave a bare page-break
+// marker with nothing on either side) and marking real page boundaries so
+// staff reviewing the imported text can tell where one page ended and the
+// next began.
+fn join_page_texts(pages: Vec<String>) -> String {
+    pages
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(PDF_PAGE_BREAK_MARKER)
+}
+
+fn run_tesseract(image_path: &std::path::Path) -> Result<String, String> {
+    let output = std::process::Command::new("tesseract")
+        .arg(image_path)
+        .arg("stdout")
+        .output()
+        .map_err(|e| {
+            format!(
+                "Could not run 'tesseract' ({e}). Local OCR engine not found — install \
+                 Tesseract OCR and make sure `tesseract` is on PATH."
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "Tesseract failed to read this file: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+// Renders every page of a PDF to a PNG in `out_dir` via Poppler's
+// `pdftoppm`, only called once direct text-layer extraction has already
+// come back empty (see `ocr_import_document_sync`) — this is the expensive
+// path, reserved for PDFs that are actually scanned images under the hood.
+fn render_pdf_pages_to_png(
+    pdf_path: &std::path::Path,
+    out_dir: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let prefix = out_dir.join("page");
+    let output = std::process::Command::new("pdftoppm")
+        .arg("-png")
+        .arg(pdf_path)
+        .arg(&prefix)
+        .output()
+        .map_err(|e| {
+            format!(
+                "Could not run 'pdftoppm' ({e}). This PDF has no extractable text layer, so \
+                 rendering it to images for OCR requires Poppler — install Poppler and make \
+                 sure `pdftoppm` is on PATH."
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "pdftoppm failed to render this PDF: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let mut pages: Vec<std::path::PathBuf> = std::fs::read_dir(out_dir)
+        .map_err(|e| format!("Could not read the rendered-page directory: {e}"))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("page-"))
+                .unwrap_or(false)
+        })
+        .collect();
+    pages.sort();
+    Ok(pages)
+}
+
+fn ocr_import_document_sync(path: &str) -> Result<String, String> {
+    let path_buf = std::path::PathBuf::from(path);
+
+    if has_extension(&path_buf, IMAGE_EXTENSIONS) {
+        return run_tesseract(&path_buf);
+    }
+
+    if !has_extension(&path_buf, &["pdf"]) {
+        return Err(
+            "Unsupported file type. Import supports images (PNG, JPG, TIFF, BMP) and PDFs."
+                .to_string(),
+        );
+    }
+
+    // Cheap path first: most policy-style PDFs (and some referral letters)
+    // already have a real text layer — Phase 6 already proved this is the
+    // common shape for a payer policy PDF, and it's a fair bet for other
+    // documents too. Only fall back to rendering + OCR when this doesn't
+    // yield real content, since that fallback is meaningfully slower.
+    if let Ok(text) = pdf_extract::extract_text(&path_buf) {
+        if is_meaningful_text(&text) {
+            return Ok(text.trim().to_string());
+        }
+    }
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("priorauth-ocr-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("Could not create a temp directory for OCR: {e}"))?;
+
+    let result = (|| -> Result<String, String> {
+        let pages = render_pdf_pages_to_png(&path_buf, &temp_dir)?;
+        if pages.is_empty() {
+            return Err(
+                "No pages could be rendered from this PDF — it may be corrupt or empty."
+                    .to_string(),
+            );
+        }
+        let mut page_texts = Vec::with_capacity(pages.len());
+        for page in &pages {
+            page_texts.push(run_tesseract(page)?);
+        }
+        Ok(join_page_texts(page_texts))
+    })();
+
+    // Best-effort cleanup — a leftover temp file is a nuisance, not a
+    // reason to mask whatever the real result (or error) was.
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    result
+}
+
+#[tauri::command]
+async fn ocr_import_document(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ocr_import_document_sync(&path))
+        .await
+        .map_err(|e| format!("The import task failed unexpectedly: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +499,60 @@ mod tests {
         assert!(prompt.contains("Requested procedure: Some procedure\n"));
         assert!(!prompt.contains("Some procedure ("));
     }
+
+    // --- Phase 7: OCR / document import ---
+
+    #[test]
+    fn has_extension_matches_case_insensitively() {
+        let p = std::path::PathBuf::from("scan.PNG");
+        assert!(has_extension(&p, IMAGE_EXTENSIONS));
+        let p2 = std::path::PathBuf::from("referral.Pdf");
+        assert!(has_extension(&p2, &["pdf"]));
+    }
+
+    #[test]
+    fn has_extension_rejects_unsupported_types() {
+        let p = std::path::PathBuf::from("notes.docx");
+        assert!(!has_extension(&p, IMAGE_EXTENSIONS));
+        assert!(!has_extension(&p, &["pdf"]));
+    }
+
+    #[test]
+    fn is_meaningful_text_rejects_empty_and_noise() {
+        assert!(!is_meaningful_text(""));
+        assert!(!is_meaningful_text("   \n\t  "));
+        // A handful of stray characters from a mis-parsed structure, still
+        // under threshold — should not be trusted as a real text layer.
+        assert!(!is_meaningful_text(" . -- \n "));
+    }
+
+    #[test]
+    fn is_meaningful_text_accepts_real_content() {
+        let real = "This patient has a history of chronic lower back pain and has completed \
+                     six weeks of conservative treatment without improvement.";
+        assert!(is_meaningful_text(real));
+    }
+
+    #[test]
+    fn join_page_texts_inserts_page_break_markers_between_real_pages() {
+        let joined = join_page_texts(vec!["Page one content.".to_string(), "Page two content.".to_string()]);
+        assert_eq!(joined, "Page one content.\n\n--- page break ---\n\nPage two content.");
+    }
+
+    #[test]
+    fn join_page_texts_drops_blank_pages_without_leaving_stray_markers() {
+        let joined = join_page_texts(vec![
+            "Real content.".to_string(),
+            "   ".to_string(),
+            "More content.".to_string(),
+        ]);
+        assert_eq!(joined, "Real content.\n\n--- page break ---\n\nMore content.");
+    }
+
+    #[test]
+    fn join_page_texts_of_all_blank_pages_is_empty() {
+        assert_eq!(join_page_texts(vec!["".to_string(), "   ".to_string()]), "");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -340,7 +566,10 @@ pub fn run() {
                 .add_migrations("sqlite:priorauth.db", migrations())
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![generate_draft_text])
+        .invoke_handler(tauri::generate_handler![
+            generate_draft_text,
+            ocr_import_document
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -26,4 +26,5 @@ tauri-plugin-sql = { version = "2.4.0", features = ["sqlite"] }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-fs = "2.5.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+pdf-extract = "0.12.0"
 
