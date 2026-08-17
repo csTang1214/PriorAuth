@@ -1,0 +1,8 @@
+[
+  {
+    "file": "src/lib.rs",
+    "function": "call_ollama",
+    "pattern": "reqwest::",
+    "justification": "Loopback-only call to the local Ollama server (OLLAMA_ENDPOINT is hardcoded to 127.0.0.1:11434, see Phase 3 in development.md). Never configurable to point anywhere else."
+  }
+]

@@ -12,10 +12,6 @@
     "sql:allow-select",
     "dialog:default",
     "fs:default",
-    "fs:allow-write-text-file",
-    {
-      "identifier": "fs:scope",
-      "allow": ["**"]
-    }
+    "fs:allow-write-text-file"
   ]
 }

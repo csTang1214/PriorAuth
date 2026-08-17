@@ -52,6 +52,18 @@ jobs:
       # bitten by once.
       - uses: ilammy/msvc-dev-cmd@v1
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Phase 8 — network-call audit (development.md, spec §4.8): fails the
+      # build if any network-capable Rust call site isn't reviewed and
+      # allowlisted in scripts/network-audit-allowlist.json. Cheap text scan,
+      # no compilation needed, so it runs before cargo check to fail fast.
+      - name: Network-call audit
+        working-directory: ${{ github.workspace }}
+        run: node scripts/audit-network-calls.mjs
+
       - name: cargo check
         run: cargo check
 

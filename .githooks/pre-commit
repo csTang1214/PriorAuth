@@ -1,0 +1,7 @@
+#!/bin/sh
+# Phase 8 PHI pre-commit hook. Installed via:
+#   git config core.hooksPath .githooks
+# See CONTRIBUTING.md for details. Actual logic lives in
+# scripts/check-phi-patterns.mjs so it's a plain, testable Node module rather
+# than shell-script logic.
+exec node "$(git rev-parse --show-toplevel)/scripts/check-phi-patterns.mjs"
